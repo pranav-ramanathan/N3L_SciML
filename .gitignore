@@ -1,2 +1,6 @@
 *.jld2
 no_three_in_line_*
+.venv
+gurobi_tests/
+__pycache__/
+*.pyc
