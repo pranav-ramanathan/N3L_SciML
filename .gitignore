@@ -1,6 +1,7 @@
 *.jld2
 no_three_in_line_*
 .venv
-gurobi_tests/
+out/
+data/
 __pycache__/
 *.pyc
