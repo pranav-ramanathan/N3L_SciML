@@ -103,6 +103,8 @@ def main(
             console.print(
                 Panel.fit(
                     f"Saved dataset to [bold]{path}[/bold]\n"
+                    f"Base samples: {batch_size}\n"
+                    f"After dedup + augmentation: check HDF5\n"
                     f"Generation time: {gen_time:.2f}s\n"
                     f"Total time: {time.time() - start_total:.2f}s\n"
                     f"File size: {size_str}",

@@ -599,38 +599,67 @@ def generate_training_file(n: int, batch_size: int, save_path: str,
     history = torch.stack(gen.history_buffer)  # (T, B, n, n)
     T, B = history.shape[0], history.shape[1]
     console.log(f"[build_dataset] History shape: T={T}, B={B}, n={n}")
+    
+    # Deduplicate using set of canonical strings
+    seen_grids = set()
+    unique_indices = []
+
+    for b in range(B):
+        final_grid = history[-1, b]
+        grid_str = grid_to_canonical_string((final_grid == 1).cpu().numpy())
+        
+        if grid_str and grid_str not in seen_grids:
+            seen_grids.add(grid_str)
+            unique_indices.append(b)
+
+    console.log(f"[build_dataset] Unique base samples: {len(unique_indices)}/{B}")
+    
     dataset_entries = []
 
-    # Build one entry per final board in batch
-    for b in range(B):
+    for b in unique_indices:
+        # Get early and final snapshots (existing logic)
         point_counts = (history[:, b] == 1).sum(dim=(1, 2))
         diffs = torch.diff(point_counts, prepend=point_counts[:1])
         last_change_idx = int((diffs != 0).nonzero(as_tuple=True)[0][-1].item())
-
-        # early snapshot at ~30% of trajectory
+        
         snap_idx = max(0, int(last_change_idx * 0.3))
         early_snapshot = history[snap_idx, b]
         final_snapshot = history[last_change_idx, b]
-
-        init_grid_soft = to_soft_grid(early_snapshot)
-        final_grid_bin = to_binary_grid(final_snapshot)
-        mask_top2n = make_top2n_mask(final_grid_bin.clone(), n)
-        labels = compute_labels(final_grid_bin.clone(), n, triplets_xy0)
-
-        entry = {
-            "initial_grid": init_grid_soft.numpy().astype("float32"),
-            "target_grid":  final_grid_bin.numpy().astype("float32"),
-            "mask_top2n":   mask_top2n.numpy().astype("float32"),
-            "score":        labels["score"],
-            "num_points":   labels["num_points"],
-            "num_violations": labels["num_violations"],
-            "deficit":      labels["deficit"],
-            "n":            np.int32(n),
-        }
-        dataset_entries.append(entry)
+        
+        init_grid_soft = to_soft_grid(early_snapshot).numpy()
+        final_grid_bin = to_binary_grid(final_snapshot).numpy()
+        
+        # Generate augmentations
+        init_augmented = augment_grid_d4(init_grid_soft)
+        final_augmented = augment_grid_d4(final_grid_bin)
+        
+        # Filter to unique augmentations
+        unique_finals = filter_unique_augmentations(final_grid_bin, final_augmented)
+        num_unique = len(unique_finals)
+        
+        # Keep corresponding init grids
+        unique_inits = init_augmented[:num_unique]
+        
+        # Create entries for each unique augmentation
+        for init_aug, final_aug in zip(unique_inits, unique_finals):
+            final_torch = torch.from_numpy(final_aug.astype('float32'))
+            mask_top2n = make_top2n_mask(final_torch, n)
+            labels = compute_labels(final_torch, n, triplets_xy0)
+            
+            entry = {
+                "initial_grid": init_aug.astype("float32"),
+                "target_grid": final_aug.astype("float32"),
+                "mask_top2n": mask_top2n.numpy().astype("float32"),
+                "score": labels["score"],
+                "num_points": labels["num_points"],
+                "num_violations": labels["num_violations"],
+                "deficit": labels["deficit"],
+                "n": np.int32(n),
+            }
+            dataset_entries.append(entry)
 
     t2 = time.time()
-    console.log(f"[build_dataset] Built {len(dataset_entries)} entries in {t2 - t1:.2f}s")
+    console.log(f"[build_dataset] Total entries with augmentation: {len(dataset_entries)} in {t2 - t1:.2f}s")
 
     save_dataset_h5(save_path, dataset_entries, triplets_xy0, n, save_triplets_mode=save_triplets_mode)
     console.log(f"[generate_training_file] Saved to {save_path}")
@@ -640,6 +669,45 @@ def generate_training_file(n: int, batch_size: int, save_path: str,
 # ============================================
 # Small tensor helpers (outside class)
 # ============================================
+
+def grid_to_canonical_string(grid: np.ndarray) -> str:
+    """Convert binary grid to sorted token string for deduplication."""
+    indices = np.argwhere(grid > 0.5)
+    if len(indices) == 0:
+        return ""
+    n = grid.shape[0]
+    tokens = indices[:, 0] * n + indices[:, 1]
+    tokens_sorted = np.sort(tokens)
+    return ','.join(map(str, tokens_sorted))
+
+def augment_grid_d4(grid: np.ndarray) -> List[np.ndarray]:
+    """Apply all 8 D4 symmetries. Returns list including original."""
+    augmented = [grid.copy()]
+    
+    # Rotations
+    for k in [1, 2, 3]:
+        augmented.append(np.rot90(grid, k=k))
+    
+    # Reflections
+    augmented.append(np.fliplr(grid))
+    augmented.append(np.flipud(grid))
+    augmented.append(np.fliplr(np.rot90(grid, k=1)))
+    augmented.append(np.flipud(np.rot90(grid, k=1)))
+    
+    return augmented
+
+def filter_unique_augmentations(original: np.ndarray, 
+                                augmented_list: List[np.ndarray]) -> List[np.ndarray]:
+    """Keep only augmentations that differ from original."""
+    original_str = grid_to_canonical_string(original)
+    unique = [original]  # Always include original
+    
+    for aug in augmented_list[1:]:  # Skip first (is original)
+        aug_str = grid_to_canonical_string(aug)
+        if aug_str != original_str:
+            unique.append(aug)
+    
+    return unique
 
 def to_soft_grid(grid: torch.Tensor, noise_level: float = 0.3) -> torch.Tensor:
     """{1,0,-1} -> Float32 soft grid: 1->1.0, 0->U[0,noise], -1->0.0"""
