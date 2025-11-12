@@ -18,7 +18,6 @@ using Functors
 using LineSearches
 using Dates
 using StableRNGs
-# using NNlib
 
 # ============================================================================
 # DATA LOADING
@@ -109,7 +108,9 @@ const LINES = _build_lines(Int(n), triplets)
 # ============================================================================
 
 # Initialize random number generator
-rng = Xoshiro(42)
+rnd_seed = abs(rand(UInt32))
+println("Random seed: $rnd_seed")
+rng = Xoshiro(rnd_seed)
 
 # Grid dimensions
 F = n * n
@@ -117,9 +118,9 @@ F = n * n
 # Define neural networks for UDE terms (similar to epidemiology.jl style)
 # Simplified to single network for dynamics
 NN_dynamics = Chain(
-    Dense(F, 128, tanh),
-    Dense(128, 64, tanh),
-    Dense(64, F)
+    Dense(F, 64, relu),
+    Dense(64, 32, relu),
+    Dense(32, F)
 )
 
 # Setup parameters
@@ -139,11 +140,6 @@ println("Network parameters: $(length(θ0))")
 UDE dynamics function: dx/dt = NN(x; θ)
 Includes soft constraints for box bounds and collinearity
 """
-
-# @inline sp(z::Float32; β::Float32=10f0) = (1f0/β) * log1p(exp(β*z))
-# lower = sp(-u[i])
-# upper = sp(u[i] - 1f0)
-
 function ude_dynamics!(du, u, p, t)
     # Neural network prediction
     y, _ = Lux.apply(NN_dynamics, u, p, st_nn)
@@ -153,9 +149,7 @@ function ude_dynamics!(du, u, p, t)
     
     # Compute derivatives element-wise without mutation
     for i in eachindex(du)
-        lower = (u[i] < 0) * u[i]
-        upper = (u[i] > 1) * (u[i] - 1)
-        du[i] = y[i] - penalty_strength * (lower + upper)
+        du[i] = y[i] - penalty_strength * (u[i] < 0) * u[i] - penalty_strength * (u[i] > 1) * (u[i] - 1)
     end
     
     return nothing
@@ -198,95 +192,43 @@ end
 """
 Loss function combining reconstruction and constraint violations
 """
-
+function loss(θ, batch_data)
+    total_loss = 0.0f0
+    
+    for sample in batch_data
+        u0 = vec(sample.initial)
+        target = vec(sample.target)
+        mask = vec(sample.mask)
+        
+        # Forward prediction
+        pred = predict(θ, u0)
+        
+        # Reconstruction loss (weighted by mask)
+        weight = 1.0f0 .+ 5.0f0 .* mask
+        recon_loss = sum(weight .* (pred .- target).^2)
+        
+        # Constraint violations
+        violation_loss = compute_violations(pred, n)
+        
+        # Box penalty 
+        box_loss = sum(max.(0.0f0, -pred).^2 + max.(0.0f0, pred .- 1.0f0).^2)
+        
+        # Combine losses
+        total_loss += recon_loss + 50.0f0 * violation_loss + 10.0f0 * box_loss
+    end
+    
+    return total_loss / length(batch_data)
+end
 
 # ============================================================================
 # TRAINING
 # ============================================================================
 
-BATCH_SIZE = 8
-MAX_ITER_ADAM = 1500
-MAX_ITER_LBFGS = 1500
+# Training configuration
+BATCH_SIZE = 4
+MAX_ITER_ADAM = 500
+MAX_ITER_LBFGS = 1000
 LR = 0.01f0
-
-const ALPHA_POINTS   = 1.0f0    # reward for placing points
-const BETA_VIOLATION = 50.0f0   # weight on 3-in-line violations
-const GAMMA_BOX      = 10.0f0   # weight on box [0,1] penalty
-# const ETA_SURPLUS    = 10.0f0   # penalty on points beyond 2n
-
-# Loss weights
-const LAMBDA_E       = 1.0f0    # weight on final energy
-const LAMBDA_DELTAE  = 0.5f0    # weight on energy improvement (E_pred - E0)
-const LAMBDA_RECON   = 0.5f0    # small reconstruction anchor (set 0f0 to disable)
-const LAMBDA_WD      = 1e-4   # weight decay (set 0f0 to disable)
-
-const ETA_LOW  = 10.0f0   # penalty when underfilling
-const ETA_HIGH = 10.0f0  # penalty when overfilling
-
-# Tiny L2 over params (ComponentArray-friendly)
-function l2_params(θ)
-    # θ is a ComponentVector; iterate its flattened entries directly
-    s = 0.0f0
-    @inbounds @simd for v in θ
-        s += float(v) * float(v)
-    end
-    return s
-end
-
-
-function grid_energy(x::AbstractVector{<:Real}, n::Integer)
-    # (1) Violation penalty
-    viol = compute_violations(x, n)
-
-    # (2) Box penalty (same as before)
-    box = sum(max.(0.0f0, -x).^2 .+ max.(0.0f0, x .- 1.0f0).^2)
-
-    # (3) Point equilibrium: penalty on deviation from 2n
-    P = sum(x)
-    diff_low  = max(0.0f0, 2.0f0 * Float32(n) - P)  # too few points
-    diff_high = max(0.0f0, P - 2.0f0 * Float32(n))  # too many points
-
-    # You can use asymmetric weights if you want to penalize surplus more heavily
-
-    points_t = ETA_LOW * diff_low^2 + ETA_HIGH * diff_high^2
-
-    return BETA_VIOLATION * viol + GAMMA_BOX * box + points_t
-end
-
-@inline softplus(z::Float32; β::Float32=10f0) = (1f0/β) * log1p(exp(β*z))
-
-function loss(θ, batch_data)
-    total = 0.0f0
-
-    @inbounds for sample in batch_data
-        u0     = vec(sample.initial)
-        target = vec(sample.target)
-        mask   = vec(sample.mask)
-
-        # Forward prediction
-        pred = predict(θ, u0)
-
-        # Energy terms
-        E_pred = grid_energy(pred, n)
-        E0     = grid_energy(u0, n)     # encourages energy decrease
-
-        # Optional: small reconstruction anchor for stability
-        weight = 1.0f0 .+ 5.0f0 .* mask
-        L_rec  = sum(weight .* (pred .- target).^2)
-
-        ΔE = E_pred - E0
-        L_dec = max(0.0, ΔE)
-
-
-        # Combine
-        total += LAMBDA_E*E_pred + LAMBDA_DELTAE*L_dec + LAMBDA_RECON*L_rec
-        # total += LAMBDA_E*E_pred + L_rec
-    end
-
-    # Mean over batch + tiny weight decay
-    return total / length(batch_data) + LAMBDA_WD * l2_params(θ)
-end
-
 
 println("\n" * "="^60)
 println("Training Configuration:")
@@ -348,13 +290,14 @@ println("-"^30)
 iter = 0
 
 # Create deterministic loss for LBFGS (use fixed subset)
-function loss_lbfgs(θ, lo, hi)
+function loss_lbfgs(θ, batch)
     # Use first 8 samples for deterministic gradient
-    batch = samples[lo:min(hi, length(samples))]
     return loss(θ, batch)
 end
 
-optf2 = Optimization.OptimizationFunction((x, p) -> loss_lbfgs(x, 1, 50), adtype)
+batch_1 = get_batch(samples, 25)
+
+optf2 = Optimization.OptimizationFunction((x, p) -> loss_lbfgs(x, batch_1), adtype)
 optprob2 = Optimization.OptimizationProblem(optf2, θ_adam)
 
 @time result_lbfgs_1 = Optimization.solve(
@@ -366,9 +309,47 @@ optprob2 = Optimization.OptimizationProblem(optf2, θ_adam)
 
 θ_lbfgs_1 = result_lbfgs_1.u
 
+batch_2 = get_batch(samples, 25)
+optf3 = Optimization.OptimizationFunction((x, p) -> loss_lbfgs(x, batch_2), adtype)
+optprob3 = Optimization.OptimizationProblem(optf3, θ_lbfgs_1)
 
-θ_final = result_lbfgs_1.u
-final_loss = loss_lbfgs(θ_final, 1, 50)
+@time result_lbfgs_2 = Optimization.solve(
+    optprob3,
+    Optim.LBFGS(linesearch=LineSearches.BackTracking());
+    callback = callback,
+    maxiters = MAX_ITER_LBFGS
+)
+
+# θ_lbfgs_2 = result_lbfgs_2.u
+
+# optf4 = Optimization.OptimizationFunction((x, p) -> loss_lbfgs(x, 51, 75), adtype)
+# optprob4 = Optimization.OptimizationProblem(optf4, θ_lbfgs_2)
+
+# @time result_lbfgs_3 = Optimization.solve(
+#     optprob4,
+#     Optim.LBFGS(linesearch=LineSearches.BackTracking());
+#     callback = callback,
+#     maxiters = MAX_ITER_LBFGS
+# )
+
+# θ_lbfgs_3 = result_lbfgs_3.u
+
+# optf5 = Optimization.OptimizationFunction((x, p) -> loss_lbfgs(x, 76, 100), adtype)
+# optprob5 = Optimization.OptimizationProblem(optf5, θ_lbfgs_3)
+
+# @time result_lbfgs_4 = Optimization.solve(
+#     optprob5,
+#     Optim.LBFGS(linesearch=LineSearches.BackTracking());
+#     callback = callback,
+#     maxiters = MAX_ITER_LBFGS
+# )
+
+# θ_lbfgs_4 = result_lbfgs_4.u
+
+# θ_final = result_lbfgs_4.u
+test_batch = get_batch(samples, 25)
+θ_final = result_lbfgs_2.u
+final_loss = loss_lbfgs(θ_final, test_batch)
 
 println("LBFGS complete. Final loss: $(round(final_loss, digits=4))")
 
@@ -423,6 +404,6 @@ mkpath(dirpath)
 savefig(dirpath * "/sample_n$(n).png")
 
 # Save trained model
-save_path = dirpath * "/energy_model.jld2"
+save_path = dirpath * "/model.jld2"
 JLD2.@save save_path θ_final st_nn n triplets loss_history
 println("\n✓ Model saved to $save_path")

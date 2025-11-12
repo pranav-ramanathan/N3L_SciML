@@ -1,5 +1,5 @@
 """
-Evaluate and visualize UDE model on all available samples
+Evaluate and visualize Energy-based UDE model on all available samples
 """
 
 # ============================================================================
@@ -51,25 +51,25 @@ end
 # ============================================================================
 
 # Load data
-data_path = "data/n_5.h5"
+data_path = "data/n_9.h5"
 n, triplets, samples = load_data(data_path)
 println("Loaded $(length(samples)) samples for $(n)×$(n) grid")
 
 # Load trained model
-model_path = "out/251104162320_5/energy_model.jld2"
+model_path = "out/251110160140_9/energy_model.jld2"
 if !isfile(model_path)
     error("Model file not found: $model_path. Please train the model first.")
 end
 
-JLD2.@load model_path θ_final st_nn loss_history  # keep dataset n & triplets to avoid mismatch
+JLD2.@load model_path θ_final st_nn n triplets loss_history
 println("✓ Model loaded from $model_path")
 
-# Recreate neural network architecture
+# Recreate neural network architecture (must match training in ude_energy.jl)
 F = n * n
-NN_dynamics = Chain(
-    Dense(F, 128, tanh),
-    Dense(128, 64, tanh),
-    Dense(64, F)
+const NN_dynamics = Lux.Chain(
+    Lux.Dense(F, 64, tanh),
+    Lux.Dense(64, 32, tanh),
+    Lux.Dense(32, F)
 )
 
 # ============================================================================
@@ -118,16 +118,9 @@ end
 const LINES = _build_lines(Int(n), triplets)
 
 """
-UDE dynamics function
+UDE dynamics function: dx/dt = NN(x; θ)
+Includes soft constraints for box bounds
 """
-# function ude_dynamics!(du, u, p, t)
-#     y, _ = Lux.apply(NN_dynamics, u, p, st_nn)
-#     penalty_strength = 10.0f0
-#     for i in eachindex(du)
-#         du[i] = y[i] - penalty_strength * (u[i] < 0) * u[i] - penalty_strength * (u[i] > 1) * (u[i] - 1)
-#     end
-#     return nothing
-# end
 function ude_dynamics!(du, u, p, t)
     # Neural network prediction
     y, _ = Lux.apply(NN_dynamics, u, p, st_nn)
@@ -146,12 +139,13 @@ function ude_dynamics!(du, u, p, t)
 end
 
 """
-Predict using the trained model
+Predict using the trained model (direct grid-to-grid prediction)
 """
-function predict(θ, u0; t_end=5.0f0)
-    prob = ODEProblem(ude_dynamics!, u0, (0.0f0, t_end), θ)
-    sol = solve(prob, Tsit5(); 
-                reltol=1f-3, abstol=1f-5, 
+function predict(θ, grid0; t_end=5.0f0)
+    u0 = vec(grid0)
+    prob = ODEProblem(ude_dynamics!, u0, (0.0f0, Float32(t_end)), θ)
+    sol = solve(prob, Tsit5();
+                reltol=1f-3, abstol=1f-5,
                 save_everystep=false,
                 sensealg=InterpolatingAdjoint(autojacvec=ZygoteVJP()))
     return sol.u[end]
@@ -204,8 +198,7 @@ println("="^60)
 results = []
 
 for (idx, sample) in enumerate(samples)
-    u0 = vec(sample.initial)
-    pred = predict(θ_final, u0)
+    pred = predict(θ_final, sample.initial)
     pred_binary = decode_topk(pred, n)
     vlines = violating_lines(vec(pred_binary), n)
     violations = Float32(length(vlines))
@@ -305,9 +298,9 @@ end
 
 # Create grid layout (2 columns, 5 rows for 10 samples)
 plot(plots_grid..., layout=(5, 2), size=(700, 1600))
-savefig("best_10_samples.png")
+savefig("best_10_samples_energy.png")
 
-println("✓ Best 10 samples saved as best_10_samples.png")
+println("✓ Best 10 samples saved as best_10_samples_energy.png")
 
 # ============================================================================
 # RANDOM INITIALIZATION MODE (optional)
@@ -322,14 +315,14 @@ function random_init_best(N_RANDOM::Int=200; seed::Int=42, k::Int=10)
     runs = Any[]
     for r in 1:N_RANDOM
         # Random continuous init in [0,1]
-        u0 = rand(rng, Float32, F)
-        pred = predict(θ_final, u0)
+        grid0 = rand(rng, Float32, n, n)
+        pred = predict(θ_final, grid0)
         pred_binary = decode_topk(pred, n)
         vlines_r = violating_lines(vec(pred_binary), n)
         vcount = length(vlines_r)
         push!(runs, (
             idx = r,
-            u0 = u0,
+            grid0 = grid0,
             pred = pred,
             pred_binary = pred_binary,
             vlines = vlines_r,
@@ -351,8 +344,8 @@ function random_init_best(N_RANDOM::Int=200; seed::Int=42, k::Int=10)
     p_best = plot_grid_with_points(best_random.pred_binary,
                                    "Random best: $(Int(best_random.violations)) violations";
                                    overlay_lines=best_random.vlines)
-    savefig(p_best, "random_best.png")
-    println("✓ Random best saved as random_best.png")
+    savefig(p_best, "random_best_energy.png")
+    println("✓ Random best saved as random_best_energy.png")
 
     println("\nTop $(length(topk)) random runs (by violations):")
     for r in topk
@@ -368,7 +361,7 @@ function random_init_best(N_RANDOM::Int=200; seed::Int=42, k::Int=10)
     cols = 2
     rows = ceil(Int, length(plots_grid2)/cols)
     plot(plots_grid2..., layout=(rows, cols), size=(700, 1600))
-    outname = "random_best_$(length(topk)).png"
+    outname = "random_best_$(length(topk))_energy.png"
     savefig(outname)
     println("✓ Top $(length(topk)) random runs saved as $(outname)")
 
@@ -376,9 +369,10 @@ function random_init_best(N_RANDOM::Int=200; seed::Int=42, k::Int=10)
 end
 
 # Configure and run random search (set N_RANDOM=0 to skip)
-N_RANDOM = 100000
+N_RANDOM = 1000
 random_init_best(N_RANDOM; seed=2005)
 
 println("\n" * "="^60)
 println("Evaluation Complete!")
 println("="^60)
+

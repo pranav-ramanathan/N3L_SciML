@@ -5,3 +5,6 @@ out/
 data/
 __pycache__/
 *.pyc
+*.code-workspace
+*.log
+test/
